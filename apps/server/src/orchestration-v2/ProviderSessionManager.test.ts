@@ -1578,6 +1578,81 @@ it.effect(
     }),
 );
 
+it.effect(
+  "ProviderSessionManagerV2 refreshes MCP ownership when returning to an attached session",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const effect = Effect.gen(function* () {
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const registry = yield* McpSessionRegistry.McpSessionRegistry;
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("thread-provider-session-manager-return-mcp");
+        const providerSessionId = yield* idAllocator.allocate.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+          threadId,
+        });
+        yield* eventSink.write({
+          events: [yield* makeThreadCreatedEvent({ idAllocator, threadId, now })],
+        });
+        const open = manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+        const runtime = yield* open;
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        const resume = runtime.resumeThread({
+          providerThread,
+          threadId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* resume;
+        yield* resume;
+        assert.equal((yield* Ref.get(state)).resumeCount, 1);
+
+        // Switching providers replaces the thread's credential while the shared session stays attached.
+        yield* registry.revokeThread(threadId);
+        const other = yield* registry.issue({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+        });
+        yield* mcpSessions.set(other.config);
+        yield* open;
+
+        const returned = yield* mcpSessions.read(threadId);
+        assert.isDefined(returned);
+        const token = returned!.authorizationHeader.replace(/^Bearer\s+/, "");
+        assert.equal(
+          (yield* registry.resolve(token))?.thread.providerInstanceId,
+          modelSelection.instanceId,
+        );
+        assert.isUndefined(
+          yield* registry.resolve(other.config.authorizationHeader.replace(/^Bearer\s+/, "")),
+        );
+        assert.equal((yield* Ref.get(state)).openCount, 1);
+        yield* resume;
+        assert.equal((yield* Ref.get(state)).resumeCount, 2);
+        yield* resume;
+        assert.equal((yield* Ref.get(state)).resumeCount, 2);
+        yield* open;
+        assert.equal(
+          (yield* mcpSessions.read(threadId))?.providerSessionId,
+          returned!.providerSessionId,
+        );
+        yield* manager.close(providerSessionId);
+        assert.isUndefined(yield* registry.resolve(token));
+        assert.isUndefined(yield* mcpSessions.read(threadId));
+      });
+      yield* effect.pipe(Effect.provide(layerTest({ state, idleTimeoutMs: 60_000 })));
+    }),
+);
+
 it.effect.each([
   { relationshipToParent: null, subagent: false },
   { relationshipToParent: "subagent", subagent: true },
